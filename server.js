@@ -35,7 +35,6 @@ app.post('/chat', async (req, res) => {
   stream.on('text', (text) => {
     fullReply += text;
     res.write(`data: ${JSON.stringify({ text })}\n\n`);
-    res.flush && res.flush();
   });
 
   stream.on('finalMessage', () => {
