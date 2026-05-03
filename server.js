@@ -1,136 +1,44 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const Anthropic = require('@anthropic-ai/sdk');
-const { Resend } = require('resend');
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+const { runAgentWithTools } = require("./agents/toolLoop");
+const { agents } = require("./agents/index");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const client = new Anthropic();
-const resend = new Resend(process.env.RESEND_API_KEY);
-const conversations = {};
+const INVOICES_DIR = path.join(__dirname, "invoices");
+if (!fs.existsSync(INVOICES_DIR)) fs.mkdirSync(INVOICES_DIR);
+app.use("/invoices", express.static(INVOICES_DIR));
 
-// Email tool definition
-const tools = [
-  {
-    name: 'send_email',
-    description: 'Send a support confirmation email to the customer. Use this when the customer provides their email address and has a support issue.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        to: {
-          type: 'string',
-          description: 'Customer email address'
-        },
-        subject: {
-          type: 'string',
-          description: 'Email subject line'
-        },
-        body: {
-          type: 'string',
-          description: 'Email body content'
-        }
-      },
-      required: ['to', 'subject', 'body']
-    }
-  }
-];
-
-// Execute the tool
-async function executeTool(name, input) {
-  if (name === 'send_email') {
-    const { data, error } = await resend.emails.send({
-      from: 'NexaSupport <onboarding@resend.dev>',
-      to: input.to,
-      subject: input.subject,
-      html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-        <h2 style="color:#6c8cff">NexaSupport</h2>
-        <p>${input.body.replace(/\n/g, '<br/>')}</p>
-        <hr/>
-        <p style="color:#6b7280;font-size:12px">NexaSupport Customer Service</p>
-      </div>`
-    });
-
-    if (error) return `Failed to send email: ${error.message}`;
-    return `Email successfully sent to ${input.to}`;
-  }
-}
-
-app.post('/chat', async (req, res) => {
-  const { message, systemPrompt, sessionId } = req.body;
-
-  if (!conversations[sessionId]) {
-    conversations[sessionId] = [];
-  }
-
-  conversations[sessionId].push({ role: 'user', content: message });
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  let fullReply = '';
-
-  try {
-    // Agent loop
-    while (true) {
-      const response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: systemPrompt || 'You are a helpful assistant.',
-        tools: tools,
-        messages: conversations[sessionId],
-      });
-
-      // If Claude wants to use a tool
-      if (response.stop_reason === 'tool_use') {
-        const toolUse = response.content.find(b => b.type === 'tool_use');
-
-        // Tell frontend agent is acting
-        res.write(`data: ${JSON.stringify({ text: `\n⚡ Using tool: ${toolUse.name}...\n` })}\n\n`);
-
-        // Execute the tool
-        const toolResult = await executeTool(toolUse.name, toolUse.input);
-
-        // Add to conversation
-        conversations[sessionId].push({ role: 'assistant', content: response.content });
-        conversations[sessionId].push({
-          role: 'user',
-          content: [{
-            type: 'tool_result',
-            tool_use_id: toolUse.id,
-            content: toolResult
-          }]
-        });
-
-        // Continue the loop — Claude will now respond with final answer
-        continue;
-      }
-
-      // Claude is done — stream the final text response
-      const textBlock = response.content.find(b => b.type === 'text');
-      if (textBlock) {
-        fullReply = textBlock.text;
-        // Stream word by word for effect
-        const words = fullReply.split(' ');
-        for (const word of words) {
-          res.write(`data: ${JSON.stringify({ text: word + ' ' })}\n\n`);
-          await new Promise(r => setTimeout(r, 20));
-        }
-      }
-
-      conversations[sessionId].push({ role: 'assistant', content: fullReply });
-      break;
-    }
-
-  } catch (err) {
-    res.write(`data: ${JSON.stringify({ text: 'Something went wrong.' })}\n\n`);
-  }
-
-  res.write(`data: [DONE]\n\n`);
-  res.end();
+app.get("/", (req, res) => {
+  res.json({ status: "ok", agents: Object.keys(agents), phase: "3" });
 });
 
-app.listen(3000, () => console.log('Server running on port 3000'));
+app.post("/chat", async (req, res) => {
+  const { agent, messages } = req.body;
+  if (!agent || !messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "Missing required fields: agent, messages" });
+  }
+  if (!agents[agent]) {
+    return res.status(400).json({ error: `Unknown agent "${agent}". Valid: aria, rex, mila` });
+  }
+  try {
+    const { reply, toolsUsed } = await runAgentWithTools(agent, messages);
+    res.json({ reply, toolsUsed, agent });
+  } catch (err) {
+    console.error(`[${agent}] Error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n🤖 AI Chatbot Backend running on port ${PORT}`);
+  console.log(`   Aria: email tool ✅`);
+  console.log(`   Rex:  web search ✅`);
+  console.log(`   Mila: PDF invoice generator ✅\n`);
+});
